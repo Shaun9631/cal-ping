@@ -333,18 +333,31 @@ def main():
         run_once(cfg, silent="--silent" in args)
         return
 
+    # --loop-minutes N: keep checking for N minutes then exit (one GitHub "shift").
+    limit = None
+    for a in sys.argv[1:]:
+        if a.startswith("--loop-minutes="):
+            limit = time.time() + float(a.split("=", 1)[1]) * 60
+    silent_first = "--silent" in args
+
     print(f"Watching {len(cfg['items'])} entries for {cfg['window_start']} .. {cfg['window_end']} "
-          f"every ~{cfg['check_every_seconds']}s. Ctrl+C to stop.", flush=True)
+          f"every ~{cfg['check_every_seconds']}s." + (" Ctrl+C to stop." if limit is None else ""), flush=True)
     while True:
+        if date.today().isoformat() > cfg["window_end"]:
+            print("Window has passed — stopping.", flush=True)
+            open(os.path.join(HERE, "WINDOW_OVER"), "w").close()  # tells the workflow not to restart
+            return
         try:
-            run_once(cfg)
+            run_once(cfg, silent=silent_first)
         except Exception as e:
             print(f"  ! check failed: {e}", flush=True)
-        if date.today().isoformat() > cfg["window_end"]:
-            print("Window has passed — stopping.")
-            return
+        silent_first = False
         base = cfg["check_every_seconds"]
-        time.sleep(base + random.uniform(-0.2, 0.3) * base)
+        pause = base + random.uniform(-0.2, 0.3) * base
+        if limit is not None and time.time() + pause > limit:
+            print("Shift over.", flush=True)
+            return
+        time.sleep(pause)
 
 
 if __name__ == "__main__":

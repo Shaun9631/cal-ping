@@ -1,14 +1,21 @@
 name: check
 
+# One run = a ~5-hour "shift" that checks every couple of minutes, then starts the
+# next shift itself. GitHub's own timer is unreliable for frequent schedules, so the
+# hourly schedule below is only a backup that restarts the chain if it ever breaks.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 min (GitHub may delay runs a few minutes when busy)
-  workflow_dispatch:         # lets you click "Run workflow" manually
+    - cron: "17 * * * *"
+  workflow_dispatch:
     inputs:
       silent:
-        description: "Record current openings without alerting"
+        description: "Record current openings without alerting (first check only)"
         type: boolean
         default: false
+
+permissions:
+  contents: read
+  actions: write   # lets a finished shift start the next one
 
 concurrency:
   group: ping
@@ -17,7 +24,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +37,7 @@ jobs:
           pip install -q playwright
           python -m playwright install --with-deps chromium
 
-      # Remember which slots were already alerted on between runs.
+      # Remember which slots were already alerted on between shifts.
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
@@ -38,7 +45,7 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
-      - name: Check for openings
+      - name: Check for openings (about 5 hours)
         env:
           APP_CONFIG: ${{ secrets.APP_CONFIG }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -46,7 +53,7 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python ping.py --once ${{ inputs.silent && '--silent' || '' }}
+        run: python ping.py --loop-minutes=300 ${{ inputs.silent && '--silent' || '' }}
 
       - name: Save state
         if: always()
@@ -54,3 +61,9 @@ jobs:
         with:
           path: state.json
           key: state-${{ github.run_id }}
+
+      - name: Start next shift
+        if: success() && hashFiles('WINDOW_OVER') == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run check.yml -R ${{ github.repository }}
