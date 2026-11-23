@@ -1,5 +1,4 @@
 {
-  "api_url": "https://example.com/api/availability/",
   "link_template": "https://example.com/book?vt={vt}&id={npi}&dept={dept}&d={d}",
   "window_start": "2026-12-01",
   "window_end": "2026-12-23",
@@ -21,5 +20,7 @@
         ]
       ]
     }
-  ]
+  ],
+  "insurance": "Other",
+  "timezone": "America/Chicago"
 }

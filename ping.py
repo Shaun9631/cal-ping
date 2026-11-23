@@ -1,13 +1,15 @@
 """
-cal-ping: watches a public availability API and pings Discord/Telegram when
-a new opening shows up inside a date window. Read-only; never books anything.
-All targets (API url, link template, entries) come from config / APP_CONFIG.
+cal-ping: opens public booking pages in a headless browser, reads the times
+they offer, and pings Discord/Telegram when a new opening shows up inside a
+date window. Read-only; never clicks a time or books anything.
+All targets (link template, entries) come from config / APP_CONFIG.
 
 Usage:
   python ping.py            # run forever, checking every N seconds
   python ping.py --once     # check once and exit (for cron / GitHub Actions)
   python ping.py --test     # send a test notification and exit
   python ping.py --show     # print what's open right now, no alerts
+  python ping.py --earliest # earliest opening per entry (any date), JSON
 
 Secrets (env vars or a .env file next to this script):
   DISCORD_WEBHOOK_URL
@@ -16,10 +18,11 @@ Secrets (env vars or a .env file next to this script):
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
@@ -60,33 +63,67 @@ def post_json(url, payload, timeout=20):
         return json.loads(body) if body.strip() else {}
 
 
-def fetch_slots(doc, start, end):
-    """Return list of slots for one entry between start and end (YYYY-MM-DD)."""
-    payload = {
-        "provider": doc["npi"],
-        "providerType": "NPI",
-        "providerGroup": "pcg",
-        "startDate": start,
-        "endDate": end,
-        "visitTypes": [{"id": vt, "method": m} for vt, m in doc["visit_types"]],
-        "departments": [{"id": doc["dept"], "type": "External"}],
-        "facets": ["date"],
-        "limit": 100,
-        "lookahead": False,
-    }
-    data = post_json(CFG["api_url"], payload)
-    out = []
-    for res in data.get("_result", []):
-        for s in (res.get("availability") or {}).get("slots", []) or []:
-            if not (start <= s["date"] <= end):
-                continue
-            out.append({
-                "date": s["date"],
-                "start": s["start"],
-                "method": s.get("visit_method", "in_person"),
-                "vt": s.get("visit_type") or doc["visit_types"][0][0],
-            })
-    return out
+def to_local(utc_str):
+    """'2027-02-03T16:30:00Z' -> ('2027-02-03', '10:30') in US Central time."""
+    dt = datetime.strptime(utc_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        local = dt.astimezone(ZoneInfo(CFG.get("timezone", "America/Chicago")))
+    except Exception:  # no tz database (bare Windows): CST, fine for Nov-Mar
+        local = dt.astimezone(timezone(timedelta(hours=-6)))
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
+def fetch_slots_page(browser, doc, start, scrolls=2):
+    """Open the real booking page like a visitor would and read the times it offers.
+
+    Returns every slot the page loaded (any date). Read-only: it answers the
+    insurance question and looks at the list; it never clicks a time.
+    """
+    from playwright.sync_api import TimeoutError as PWTimeout
+    out = {}
+    for vt, method in doc["visit_types"]:
+        url = CFG["link_template"].format(vt=vt, npi=doc["npi"], dept=doc["dept"], d=start)
+        ctx = browser.new_context(user_agent=UA, locale="en-US", timezone_id=CFG.get("timezone", "America/Chicago"))
+        page = ctx.new_page()
+        responses = []
+        page.on("response", lambda r: responses.append(r) if "GetSlots" in r.url else None)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:  # insurance question (not every page asks it)
+                page.get_by_text(CFG.get("insurance", "Other"), exact=True).first.click(timeout=25000)
+                page.get_by_role("button", name=re.compile(r"^Continue")).filter(visible=True).first.click(timeout=10000)
+            except PWTimeout:
+                pass
+            for _ in range(40):  # wait up to ~20s for the first batch of times
+                if responses:
+                    break
+                page.wait_for_timeout(500)
+            page.wait_for_timeout(2500)
+            for _ in range(scrolls):  # scrolling loads further dates
+                page.mouse.wheel(0, 20000)
+                page.wait_for_timeout(2500)
+            for r in responses:
+                try:
+                    data = r.json()
+                except Exception:
+                    continue
+                for sol in data.get("Solutions") or []:
+                    for s in sol.get("Slots") or []:
+                        if not s.get("DisplayDateTimeUtc"):
+                            continue
+                        d, t = to_local(s["DisplayDateTimeUtc"])
+                        out[(d, t, method)] = {"date": d, "start": t, "method": method, "vt": vt}
+            if not responses:
+                print(f"  ! {doc['name']} ({method}): page showed no time list", flush=True)
+        finally:
+            ctx.close()
+    return list(out.values())
+
+
+def fetch_slots(browser, doc, start, end):
+    """Slots for one entry between start and end (YYYY-MM-DD), straight from the booking page."""
+    return [s for s in fetch_slots_page(browser, doc, start) if start <= s["date"] <= end]
 
 
 def pretty_time(d, t):
@@ -106,18 +143,45 @@ def check(cfg):
     if start > end:
         return found
     max_rank = cfg.get("alert_max_rank", 99)
-    for doc in sorted(cfg["items"], key=lambda d: d["rank"]):
-        if doc["rank"] > max_rank:
-            continue
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
         try:
-            slots = fetch_slots(doc, start, end)
-        except Exception as e:  # network hiccup: log and move on
-            print(f"  ! {doc['name']}: {e}", flush=True)
-            continue
-        if slots:
-            found[doc["name"]] = (doc, sorted(slots, key=lambda s: (s["date"], s["start"])))
-        time.sleep(random.uniform(1.0, 3.0))  # be polite between entries
+            for doc in sorted(cfg["items"], key=lambda d: d["rank"]):
+                if doc["rank"] > max_rank:
+                    continue
+                try:
+                    slots = fetch_slots(browser, doc, start, end)
+                except Exception as e:  # page hiccup: log and move on
+                    print(f"  ! {doc['name']}: {e}", flush=True)
+                    continue
+                if slots:
+                    found[doc["name"]] = (doc, sorted(slots, key=lambda s: (s["date"], s["start"])))
+                time.sleep(random.uniform(1.0, 3.0))  # be polite between entries
+        finally:
+            browser.close()
     return found
+
+
+def earliest(cfg):
+    """{name: (doc, first_slot_or_None)} — earliest opening from today, any date."""
+    from playwright.sync_api import sync_playwright
+    today = date.today().isoformat()
+    res = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            for doc in sorted(cfg["items"], key=lambda d: d["rank"]):
+                try:
+                    slots = sorted((s for s in fetch_slots_page(browser, doc, today, scrolls=0) if s["date"] >= today),
+                                   key=lambda s: (s["date"], s["start"]))
+                    res[doc["name"]] = (doc, slots)
+                except Exception as e:
+                    print(f"  ! {doc['name']}: {e}", flush=True)
+                    res[doc["name"]] = (doc, None)
+        finally:
+            browser.close()
+    return res
 
 
 def build_message(cfg, new_by_doc):
@@ -223,6 +287,10 @@ def main():
 
     if "--test" in args:
         notify("✅ cal-ping test message — notifications are working.")
+        return
+    if "--earliest" in args:
+        res = earliest(cfg)
+        print(json.dumps({n: [doc["rank"], sl[:3] if sl else sl] for n, (doc, sl) in res.items()}, indent=1))
         return
     if "--show" in args:
         found = check(cfg)
