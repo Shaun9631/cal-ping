@@ -7,6 +7,7 @@ All targets (link template, entries) come from config / APP_CONFIG.
 Usage:
   python ping.py            # run forever, checking every N seconds
   python ping.py --once     # check once and exit (for cron / GitHub Actions)
+  python ping.py --once --silent  # record what's open now without alerting
   python ping.py --test     # send a test notification and exit
   python ping.py --show     # print what's open right now, no alerts
   python ping.py --earliest # earliest opening per entry (any date), JSON
@@ -74,7 +75,7 @@ def to_local(utc_str):
     return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
 
 
-def fetch_slots_page(browser, doc, start, scrolls=2):
+def fetch_slots_page(browser, doc, start, scrolls=12, end=None):
     """Open the real booking page like a visitor would and read the times it offers.
 
     Returns every slot the page loaded (any date). Read-only: it answers the
@@ -100,20 +101,37 @@ def fetch_slots_page(browser, doc, start, scrolls=2):
                     break
                 page.wait_for_timeout(500)
             page.wait_for_timeout(2500)
-            for _ in range(scrolls):  # scrolling loads further dates
-                page.mouse.wheel(0, 20000)
-                page.wait_for_timeout(2500)
-            for r in responses:
-                try:
-                    data = r.json()
-                except Exception:
-                    continue
-                for sol in data.get("Solutions") or []:
-                    for s in sol.get("Slots") or []:
-                        if not s.get("DisplayDateTimeUtc"):
-                            continue
-                        d, t = to_local(s["DisplayDateTimeUtc"])
-                        out[(d, t, method)] = {"date": d, "start": t, "method": method, "vt": vt}
+            parsed = 0
+
+            def absorb():
+                nonlocal parsed
+                for r in responses[parsed:]:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        continue
+                    for sol in data.get("Solutions") or []:
+                        for s in sol.get("Slots") or []:
+                            if not s.get("DisplayDateTimeUtc"):
+                                continue
+                            d, t = to_local(s["DisplayDateTimeUtc"])
+                            out[(d, t, method)] = {"date": d, "start": t, "method": method, "vt": vt}
+                parsed = len(responses)
+
+            absorb()
+            # Keep scrolling (which loads further dates) until the list reaches past `end`,
+            # so the whole window is read every time and slots don't flicker in and out.
+            stalls = 0
+            for _ in range(scrolls):
+                if end and out and max(k[0] for k in out) > end:
+                    break
+                before = len(responses)
+                page.mouse.wheel(0, 30000)
+                page.wait_for_timeout(3000)
+                absorb()
+                stalls = stalls + 1 if len(responses) == before else 0
+                if stalls >= 2:
+                    break
             if not responses:
                 print(f"  ! {doc['name']} ({method}): page showed no time list", flush=True)
         finally:
@@ -123,7 +141,7 @@ def fetch_slots_page(browser, doc, start, scrolls=2):
 
 def fetch_slots(browser, doc, start, end):
     """Slots for one entry between start and end (YYYY-MM-DD), straight from the booking page."""
-    return [s for s in fetch_slots_page(browser, doc, start) if start <= s["date"] <= end]
+    return [s for s in fetch_slots_page(browser, doc, start, end=end) if start <= s["date"] <= end]
 
 
 def pretty_time(d, t):
@@ -244,28 +262,40 @@ def notify(text):
         print("  (no Discord/Telegram configured — printing instead)\n" + text, flush=True)
 
 
-def run_once(cfg, alert=True):
-    state = load_json("state.json", {"seen": []})
-    seen = set(state["seen"])
+def run_once(cfg, alert=True, silent=False):
+    # seen = {slot_key: unix time it was last seen open}
+    now = time.time()
+    state = load_json("state.json", {"seen": {}})
+    seen = state["seen"]
+    if isinstance(seen, list):  # older format: treat everything in it as seen just now
+        seen = {k: now for k in seen}
     found = check(cfg)
     stamp = datetime.now().strftime("%H:%M:%S")
 
+    # Alert only for slots never seen before, or ones that vanished (someone booked) and were
+    # gone for a while before reappearing (a cancellation). Slots that simply stay open, or
+    # blink out for a check or two because a page loaded slowly, never re-alert.
+    realert_after = cfg.get("realert_after_hours", 12) * 3600
+    key = lambda doc, s: f"{doc['npi']}|{s['date']}|{s['start']}|{s['method']}"
     new_by_doc = {}
     for name, (doc, slots) in found.items():
-        fresh = [s for s in slots if f"{doc['npi']}|{s['date']}|{s['start']}|{s['method']}" not in seen]
+        fresh = [s for s in slots if now - seen.get(key(doc, s), 0) > realert_after]
         if fresh:
             new_by_doc[name] = (doc, fresh)
 
     summary = ", ".join(f"#{d['rank']} {n.split(',')[0]}: {len(s)}" for n, (d, s) in found.items()) or "nothing"
     print(f"[{stamp}] open in window -> {summary}", flush=True)
 
-    if alert and new_by_doc:
+    if alert and new_by_doc and not silent:
         notify(build_message(cfg, new_by_doc))
+    elif silent and new_by_doc:
+        print(f"  (silent) recorded {sum(len(v[1]) for v in new_by_doc.values())} slot(s) without alerting", flush=True)
 
-    # Remember only currently-open slots, so a slot that disappears and comes back re-alerts.
-    state["seen"] = sorted(
-        f"{d['npi']}|{s['date']}|{s['start']}|{s['method']}" for d, sl in found.values() for s in sl
-    )
+    for d, sl in found.values():
+        for s in sl:
+            seen[key(d, s)] = now
+    today = date.today().isoformat()
+    state["seen"] = {k: t for k, t in seen.items() if k.split("|")[1] >= today}  # drop past dates
     if alert:
         save_json("state.json", state)
     return found
@@ -300,7 +330,7 @@ def main():
             print(f"#{doc['rank']} {name}: " + ", ".join(pretty_time(s["date"], s["start"]) for s in slots))
         return
     if "--once" in args:
-        run_once(cfg)
+        run_once(cfg, silent="--silent" in args)
         return
 
     print(f"Watching {len(cfg['items'])} entries for {cfg['window_start']} .. {cfg['window_end']} "

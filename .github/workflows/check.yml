@@ -3,7 +3,12 @@ name: check
 on:
   schedule:
     - cron: "*/5 * * * *"   # every 5 min (GitHub may delay runs a few minutes when busy)
-  workflow_dispatch: {}      # lets you click "Run workflow" manually
+  workflow_dispatch:         # lets you click "Run workflow" manually
+    inputs:
+      silent:
+        description: "Record current openings without alerting"
+        type: boolean
+        default: false
 
 concurrency:
   group: ping
@@ -41,7 +46,7 @@ jobs:
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python ping.py --once
+        run: python ping.py --once ${{ inputs.silent && '--silent' || '' }}
 
       - name: Save state
         if: always()
