@@ -123,7 +123,14 @@ def check(cfg):
 def build_message(cfg, new_by_doc):
     lines = [f"🔔 New opening(s) before {cfg.get('current_booking', 'your current one')}!"]
     for name, (doc, slots) in sorted(new_by_doc.items(), key=lambda kv: kv[1][0]["rank"]):
-        lines.append(f"\n#{doc['rank']} {name} — {doc['where']}")
+        total = cfg.get("total_ranked")
+        rank = f"#{doc['rank']} of {total}" if total else f"#{doc['rank']}"
+        lines.append(f"\n**{rank} · {name}** — {doc['where']}")
+        if doc.get("rating"):
+            lines.append(f"  ⭐ {doc['rating']}")
+        lines.append(f"  🔁 Referrals: {doc.get('referrals') or 'no info'}")
+        if doc.get("note"):
+            lines.append(f"  📝 {doc['note']}")
         for s in slots[:6]:
             vid = " (video)" if s["method"] == "video" else ""
             lines.append(f"  • {pretty_time(s['date'], s['start'])}{vid}")
