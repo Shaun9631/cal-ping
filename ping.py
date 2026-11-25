@@ -211,6 +211,11 @@ def build_message(cfg, new_by_doc):
         if doc.get("rating"):
             lines.append(f"  ⭐ {doc['rating']}")
         lines.append(f"  🔁 Referrals: {doc.get('referrals') or 'no info'}")
+        cov = doc.get("coverage")
+        if cov:
+            both = all(cov.values())
+            parts = " · ".join(f"{k} {'✅' if v else '❌'}" for k, v in cov.items())
+            lines.append(f"  🩺 Covers both: {'✅ YES' if both else '❌ NO'} ({parts})")
         if doc.get("note"):
             lines.append(f"  📝 {doc['note']}")
         for s in slots[:6]:
@@ -220,6 +225,8 @@ def build_message(cfg, new_by_doc):
             lines.append(f"  • …and {len(slots) - 6} more")
         first = slots[0]
         lines.append("  Book: " + cfg["link_template"].format(vt=first["vt"], npi=doc["npi"], dept=doc["dept"], d=first["date"]))
+    if cfg.get("coverage_note"):
+        lines.append(f"\n⚠️ {cfg['coverage_note']}")
     lines.append(f"\nBooking is up to you. If you switch, cancel {cfg.get('current_booking', 'the old one')}.")
     return "\n".join(lines)
 
